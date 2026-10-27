@@ -2,22 +2,21 @@
 use std::{
   future::Future,
   sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
   },
 };
 
 use futures::{
   channel::{
-    mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
+    mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
     oneshot,
   },
-  future,
+  future::try_join,
   io::{AsyncRead, AsyncReadExt, AsyncWrite},
   lock::Mutex,
   sink::SinkExt,
   stream::StreamExt,
-  TryFutureExt,
 };
 
 use crate::{
@@ -107,11 +106,15 @@ where
     };
 
     let (sender, receiver) = unbounded();
-    let fut = future::try_join(
-      req.clone().io_loop(reader, sender),
-      req.clone().handler_loop(handler, receiver),
-    )
-    .map_ok(|_| ());
+    let io = req.clone().io_loop(reader, sender);
+    let handling = req.clone().handler_loop(handler, receiver);
+    let fut = async move {
+      // Let the handler drain notifications already queued by io_loop before
+      // returning its result. Wrapping that result prevents try_join from
+      // canceling the handler when io_loop fails.
+      let (result, ()) = try_join(async { Ok(io.await) }, handling).await?;
+      result
+    };
 
     (req, fut)
   }
@@ -204,11 +207,15 @@ where
     }
 
     let (sender, receiver) = unbounded();
-    let fut = future::try_join(
-      instance.clone().io_loop(reader, sender),
-      instance.clone().handler_loop(handler, receiver),
-    )
-    .map_ok(|_| ());
+    let io = instance.clone().io_loop(reader, sender);
+    let handling = instance.clone().handler_loop(handler, receiver);
+    let fut = async move {
+      // Let the handler drain notifications already queued by io_loop before
+      // returning its result. Wrapping that result prevents try_join from
+      // canceling the handler when io_loop fails.
+      let (result, ()) = try_join(async { Ok(io.await) }, handling).await?;
+      result
+    };
 
     Ok((instance, fut))
   }
@@ -299,8 +306,8 @@ where
       let msg = match receiver.next().await {
         Some(msg) => msg,
         /* If our receiver closes, that just means that io_handler started
-         * shutting down. This is normal, so shut down along with it and don't
-         * report an error
+         * shutting down. This is normal, so shut down along with it and
+         * don't report an error
          */
         None => break Ok(()),
       };
@@ -316,10 +323,8 @@ where
           let writer = self.writer.clone();
 
           handler.spawn(async move {
-            let response = match handler_c
-              .handle_request(method, params, neovim)
-              .await
-              {
+            let response =
+              match handler_c.handle_request(method, params, neovim).await {
                 Ok(result) => RpcMessage::RpcResponse {
                   msgid,
                   result,
@@ -332,17 +337,14 @@ where
                 },
               };
 
-            model::encode(writer, response)
-              .await
-              .unwrap_or_else(|e| {
-                error!("Error sending response to request {}: '{}'", msgid, e);
-              });
+            model::encode(writer, response).await.unwrap_or_else(|e| {
+              error!("Error sending response to request {}: '{}'", msgid, e);
+            });
           });
-        },
-        RpcMessage::RpcNotification {
-          method,
-          params
-        } => handler.handle_notify(method, params, self.clone()).await,
+        }
+        RpcMessage::RpcNotification { method, params } => {
+          handler.handle_notify(method, params, self.clone()).await
+        }
         RpcMessage::RpcResponse { .. } => unreachable!(),
       }
     }
@@ -368,7 +370,12 @@ where
       };
 
       debug!("Get message {:?}", msg);
-      if let RpcMessage::RpcResponse { msgid, result, error, } = msg {
+      if let RpcMessage::RpcResponse {
+        msgid,
+        result,
+        error,
+      } = msg
+      {
         let sender = find_sender(&self.queue, msgid).await?;
         if error == Value::Nil {
           sender
@@ -432,6 +439,90 @@ async fn find_sender(
 #[cfg(all(test, feature = "use_tokio"))]
 mod tests {
   use super::*;
+
+  #[derive(Clone)]
+  struct RecordingHandler {
+    sender: tokio::sync::mpsc::UnboundedSender<(String, Vec<Value>)>,
+  }
+
+  impl Handler for RecordingHandler {
+    type Writer = futures::io::Sink;
+
+    async fn handle_notify(
+      &self,
+      method: String,
+      args: Vec<Value>,
+      _neovim: Neovim<Self::Writer>,
+    ) {
+      self.sender.send((method, args)).unwrap();
+    }
+  }
+
+  #[tokio::test]
+  async fn final_notification_is_handled_before_eof() {
+    let mut wire = Vec::new();
+    model::encode_sync(
+      &mut wire,
+      RpcMessage::RpcNotification {
+        method: "redraw".into(),
+        params: vec![],
+      },
+    )
+    .unwrap();
+
+    let (sender, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    let (_, session) = Neovim::new(
+      futures::io::Cursor::new(wire),
+      futures::io::sink(),
+      RecordingHandler { sender },
+    );
+
+    let error = session.await.unwrap_err();
+    assert!(matches!(*error, LoopError::DecodeError(..)));
+    assert_eq!(notifications.try_recv().unwrap(), ("redraw".into(), vec![]));
+  }
+
+  #[tokio::test]
+  async fn handshake_delivers_connect_before_eof() {
+    let handshake = "HandshakeMessage";
+    let connect = Value::Array(vec![
+      Value::from("connect"),
+      Value::Array(vec![Value::from("hey")]),
+    ]);
+    let redraw = vec![connect];
+    let mut wire = Vec::new();
+    model::encode_sync(
+      &mut wire,
+      RpcMessage::RpcResponse {
+        msgid: 0,
+        error: Value::Nil,
+        result: Value::String(handshake.into()),
+      },
+    )
+    .unwrap();
+    model::encode_sync(
+      &mut wire,
+      RpcMessage::RpcNotification {
+        method: "redraw".into(),
+        params: redraw.clone(),
+      },
+    )
+    .unwrap();
+
+    let (sender, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+    let (_, session) = Neovim::handshake(
+      futures::io::Cursor::new(wire),
+      futures::io::sink(),
+      RecordingHandler { sender },
+      handshake,
+    )
+    .await
+    .unwrap();
+
+    let error = session.await.unwrap_err();
+    assert!(matches!(*error, LoopError::DecodeError(..)));
+    assert_eq!(notifications.try_recv().unwrap(), ("redraw".into(), redraw));
+  }
 
   #[tokio::test]
   async fn test_find_sender() {
